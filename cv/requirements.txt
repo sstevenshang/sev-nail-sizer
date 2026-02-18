@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+opencv-python-headless
+mediapipe>=0.10.32
+replicate
+numpy
+Pillow
+python-multipart
+pytest
+httpx
+pytest-asyncio
