@@ -261,3 +261,242 @@ def test_measure_hand_param_overrides_detected(client, monkeypatch):
     )
     assert resp.status_code == 200
     assert resp.json()["hand"] == "left"
+
+
+# ---------------------------------------------------------------------------
+# photo_type helpers
+# ---------------------------------------------------------------------------
+
+
+def _mock_hand_four_finger():
+    """HandResult with index/middle/ring/pinky tips; thumb at (0, 0)."""
+    from pipeline.hand_detect import HandResult
+
+    tips = {
+        "thumb":  (0, 0),
+        "index":  (280, 60),
+        "middle": (350, 55),
+        "ring":   (420, 62),
+        "pinky":  (490, 80),
+    }
+    widths = {
+        "thumb": 0.0,
+        "index": 40.0,
+        "middle": 40.0,
+        "ring": 40.0,
+        "pinky": 40.0,
+    }
+    return HandResult(
+        landmarks=[(320, 300)] * 21,
+        handedness="right",
+        fingertip_positions=tips,
+        finger_widths_px=widths,
+    )
+
+
+def _mock_hand_thumb_only():
+    """HandResult with only thumb tip meaningful; index–pinky at (0, 0)."""
+    from pipeline.hand_detect import HandResult
+
+    tips = {
+        "thumb":  (200, 80),
+        "index":  (0, 0),
+        "middle": (0, 0),
+        "ring":   (0, 0),
+        "pinky":  (0, 0),
+    }
+    widths = {
+        "thumb": 40.0,
+        "index": 0.0,
+        "middle": 0.0,
+        "ring": 0.0,
+        "pinky": 0.0,
+    }
+    return HandResult(
+        landmarks=[(320, 300)] * 21,
+        handedness="right",
+        fingertip_positions=tips,
+        finger_widths_px=widths,
+    )
+
+
+# ---------------------------------------------------------------------------
+# photo_type — auto-detect tests
+# ---------------------------------------------------------------------------
+
+
+def test_measure_photo_type_auto_detect_four_finger(client, monkeypatch):
+    """Auto-detect: hand with 4 fingers (thumb at origin) → photo_type='four_finger'."""
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "detect_card", lambda img: _mock_card())
+    monkeypatch.setattr(app_mod, "detect_hand", lambda img, hands_model=None: _mock_hand_four_finger())
+
+    resp = client.post(
+        "/pipeline/measure",
+        files={"image": ("img.jpg", _card_image_bytes(), "image/jpeg")},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["photo_type"] == "four_finger"
+
+
+def test_measure_photo_type_auto_detect_thumb(client, monkeypatch):
+    """Auto-detect: hand with only thumb → photo_type='thumb'."""
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "detect_card", lambda img: _mock_card())
+    monkeypatch.setattr(app_mod, "detect_hand", lambda img, hands_model=None: _mock_hand_thumb_only())
+
+    resp = client.post(
+        "/pipeline/measure",
+        files={"image": ("img.jpg", _card_image_bytes(), "image/jpeg")},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["photo_type"] == "thumb"
+
+
+def test_measure_photo_type_explicit_param(client, monkeypatch):
+    """Explicit photo_type param overrides auto-detection."""
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "detect_card", lambda img: _mock_card())
+    monkeypatch.setattr(app_mod, "detect_hand", lambda img, hands_model=None: _mock_hand_thumb_only())
+
+    resp = client.post(
+        "/pipeline/measure",
+        files={"image": ("img.jpg", _card_image_bytes(), "image/jpeg")},
+        data={"photo_type": "thumb"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["photo_type"] == "thumb"
+
+
+def test_measure_four_finger_only_has_four_fingers(client, monkeypatch):
+    """four_finger photo: response has only index/middle/ring/pinky, no thumb, no thumb warning."""
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "detect_card", lambda img: _mock_card())
+    monkeypatch.setattr(app_mod, "detect_hand", lambda img, hands_model=None: _mock_hand_four_finger())
+
+    resp = client.post(
+        "/pipeline/measure",
+        files={"image": ("img.jpg", _card_image_bytes(), "image/jpeg")},
+        data={"photo_type": "four_finger"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    fingers = data["fingers"]
+    assert "thumb" not in fingers
+    for name in ["index", "middle", "ring", "pinky"]:
+        assert name in fingers
+    # No thumb_not_detected warning
+    assert "thumb_not_detected" not in data["warnings"]
+
+
+def test_measure_thumb_only_has_thumb(client, monkeypatch):
+    """thumb photo: response has only thumb, no four-finger warnings."""
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "detect_card", lambda img: _mock_card())
+    monkeypatch.setattr(app_mod, "detect_hand", lambda img, hands_model=None: _mock_hand_thumb_only())
+
+    resp = client.post(
+        "/pipeline/measure",
+        files={"image": ("img.jpg", _card_image_bytes(), "image/jpeg")},
+        data={"photo_type": "thumb"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    fingers = data["fingers"]
+    assert "thumb" in fingers
+    for name in ["index", "middle", "ring", "pinky"]:
+        assert name not in fingers
+    # No warnings about the four fingers not being detected
+    for name in ["index", "middle", "ring", "pinky"]:
+        assert f"{name}_not_detected" not in data["warnings"]
+
+
+# ---------------------------------------------------------------------------
+# /pipeline/merge tests
+# ---------------------------------------------------------------------------
+
+
+def _insert_measurement(client, monkeypatch, hand_fn, photo_type_param, hand="right"):
+    """Helper: call /pipeline/measure and return the measurement ID."""
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "detect_card", lambda img: _mock_card())
+    monkeypatch.setattr(app_mod, "detect_hand", lambda img, hands_model=None: hand_fn())
+
+    resp = client.post(
+        "/pipeline/measure",
+        files={"image": ("img.jpg", _card_image_bytes(), "image/jpeg")},
+        data={"photo_type": photo_type_param, "hand": hand},
+    )
+    assert resp.status_code == 200
+    return resp.json()["id"]
+
+
+def test_merge_success(client, monkeypatch):
+    """Merge a thumb + four_finger measurement → complete 5-finger response."""
+    thumb_id = _insert_measurement(client, monkeypatch, _mock_hand_thumb_only, "thumb")
+    four_id = _insert_measurement(client, monkeypatch, _mock_hand_four_finger, "four_finger")
+
+    resp = client.post(
+        "/pipeline/merge",
+        json={"thumb_measurement_id": thumb_id, "four_finger_measurement_id": four_id},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["photo_type"] == "merged"
+    assert "id" in data
+    assert data["id"].startswith("msr_")
+    fingers = data["fingers"]
+    assert "thumb" in fingers
+    for name in ["index", "middle", "ring", "pinky"]:
+        assert name in fingers
+    # Each finger should have source_measurement
+    assert fingers["thumb"]["source_measurement"] == thumb_id
+    assert fingers["index"]["source_measurement"] == four_id
+    assert "source_measurements" in data
+
+
+def test_merge_same_photo_type_fails(client, monkeypatch):
+    """Merging two thumb measurements → 400."""
+    thumb_id1 = _insert_measurement(client, monkeypatch, _mock_hand_thumb_only, "thumb")
+    thumb_id2 = _insert_measurement(client, monkeypatch, _mock_hand_thumb_only, "thumb")
+
+    resp = client.post(
+        "/pipeline/merge",
+        json={"thumb_measurement_id": thumb_id1, "four_finger_measurement_id": thumb_id2},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["error"] == "wrong_photo_type"
+
+
+def test_merge_different_hands_fails(client, monkeypatch):
+    """Merging left thumb + right four_finger → 400."""
+    thumb_id = _insert_measurement(client, monkeypatch, _mock_hand_thumb_only, "thumb", hand="left")
+    four_id = _insert_measurement(client, monkeypatch, _mock_hand_four_finger, "four_finger", hand="right")
+
+    resp = client.post(
+        "/pipeline/merge",
+        json={"thumb_measurement_id": thumb_id, "four_finger_measurement_id": four_id},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["error"] == "hand_mismatch"
+
+
+def test_merge_not_found(client, monkeypatch):
+    """Merging with a nonexistent ID → 404."""
+    thumb_id = _insert_measurement(client, monkeypatch, _mock_hand_thumb_only, "thumb")
+
+    resp = client.post(
+        "/pipeline/merge",
+        json={"thumb_measurement_id": thumb_id, "four_finger_measurement_id": "msr_nonexistent"},
+    )
+    assert resp.status_code == 404

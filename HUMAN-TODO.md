@@ -5,10 +5,13 @@ Things only a human can do. Ordered by when I'll need them.
 ## Before Phase 1 (need ASAP)
 
 ### 📸 Test Photos (blocks development)
-- [ ] **3-5 photos** of a hand placed flat on a credit card, taken from ~12" directly above with phone camera
+**Two photos per hand** (can't fit all 5 fingers on a card at once):
+- [ ] **Photo A:** Index, middle, ring, pinky placed flat on a credit card
+- [ ] **Photo B:** Thumb placed flat on the same credit card
+- [ ] Take from ~12" directly above with phone camera
 - [ ] Good lighting (natural light or bright room)
 - [ ] Try both hands if possible
-- [ ] At least one photo with a dark-colored card, one with a light card
+- [ ] At least one set with a dark-colored card, one with a light card
 - [ ] Fingers spread slightly (nails clearly visible, not overlapping)
 
 ### 📏 Ground Truth Measurements (blocks accuracy validation)

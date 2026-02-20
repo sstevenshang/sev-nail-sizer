@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from pipeline.card_detect import detect_card
 from pipeline.curve_adjust import adjust_curve
 from pipeline.debug_viz import draw_debug_image
-from pipeline.hand_detect import detect_hand
+from pipeline.hand_detect import classify_photo_type, detect_hand
 from pipeline.measure import measure_all_nails
 from pipeline.nail_segment import segment_nails
 from pipeline.preprocess import preprocess
@@ -33,6 +33,8 @@ from pipeline.preprocess import preprocess
 app = FastAPI(title="Sev Nail Sizer — CV Service", version="1.0.0")
 
 FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
+FOUR_FINGER_NAMES = ["index", "middle", "ring", "pinky"]
+THUMB_NAMES = ["thumb"]
 
 # ---------------------------------------------------------------------------
 # Local storage configuration
@@ -58,9 +60,15 @@ def _ensure_storage() -> None:
                 fingers_json TEXT,
                 confidence  REAL,
                 warnings_json TEXT,
-                debug_image_path TEXT
+                debug_image_path TEXT,
+                photo_type  TEXT
             )
         """)
+        # Migrate existing tables that lack the photo_type column
+        try:
+            conn.execute("ALTER TABLE measurements ADD COLUMN photo_type TEXT")
+        except Exception:
+            pass  # Column already exists
 
 
 @contextmanager
@@ -81,7 +89,8 @@ def _save_measurement(
     fingers: dict,
     confidence: float,
     warnings: list,
-    debug_jpg_bytes: bytes,
+    debug_jpg_bytes: Optional[bytes] = None,
+    photo_type: Optional[str] = None,
 ) -> Optional[str]:
     """Persist a measurement record to SQLite and save the debug image.
 
@@ -92,16 +101,19 @@ def _save_measurement(
 
     _ensure_storage()
 
-    # Save debug image
-    img_path = _IMAGE_DIR / f"{measurement_id}.jpg"
-    img_path.write_bytes(debug_jpg_bytes)
+    # Save debug image (optional for merged records)
+    img_path = None
+    if debug_jpg_bytes is not None:
+        img_path = _IMAGE_DIR / f"{measurement_id}.jpg"
+        img_path.write_bytes(debug_jpg_bytes)
 
     with _get_db() as conn:
         conn.execute(
             """
             INSERT INTO measurements
-                (id, hand, px_per_mm, fingers_json, confidence, warnings_json, debug_image_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (id, hand, px_per_mm, fingers_json, confidence, warnings_json,
+                 debug_image_path, photo_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 measurement_id,
@@ -110,11 +122,12 @@ def _save_measurement(
                 json.dumps(fingers),
                 confidence,
                 json.dumps(warnings),
-                str(img_path),
+                str(img_path) if img_path else None,
+                photo_type,
             ),
         )
 
-    return str(img_path)
+    return str(img_path) if img_path else None
 
 
 # Initialise storage on startup (non-blocking — only creates if not exists)
@@ -266,12 +279,15 @@ async def validate_image(image: UploadFile = File(...)) -> dict:
 async def measure_image(
     image: UploadFile = File(...),
     hand: Optional[str] = Form(None),
+    photo_type: Optional[str] = Form(None),
 ) -> dict:
     """
     Full pipeline: preprocess → card detect → hand detect → nail segment
     → measure → curve-adjust → debug image.
     Saves result to SQLite + local filesystem.
     Returns per-finger measurements.
+
+    photo_type: "four_finger" | "thumb" — if not provided, auto-detected.
     """
     raw = await image.read()
 
@@ -313,6 +329,23 @@ async def measure_image(
         )
 
     detected_hand = hand or hand_result.handedness
+
+    # Determine photo_type: use explicit param, otherwise auto-detect
+    if photo_type is None:
+        detected_photo_type = classify_photo_type(hand_result)
+        if detected_photo_type == "unknown":
+            detected_photo_type = None  # treat as full 5-finger
+    else:
+        detected_photo_type = photo_type
+
+    # Choose which fingers to iterate over
+    if detected_photo_type == "thumb":
+        fingers_to_measure = THUMB_NAMES
+    elif detected_photo_type == "four_finger":
+        fingers_to_measure = FOUR_FINGER_NAMES
+    else:
+        fingers_to_measure = FINGER_NAMES
+
     mock_seg = os.environ.get("SEV_MOCK_SEGMENTATION") == "1"
 
     nail_masks = segment_nails(
@@ -327,9 +360,10 @@ async def measure_image(
     total_conf = 0.0
     n = 0
 
-    for finger_name in FINGER_NAMES:
+    for finger_name in fingers_to_measure:
         meas = raw_measurements.get(finger_name)
         if meas is None or meas.width_mm == 0:
+            # Only warn about fingers that are expected for this photo_type
             warnings.append(f"{finger_name}_not_detected")
             continue
 
@@ -379,6 +413,7 @@ async def measure_image(
             confidence=overall_confidence,
             warnings=warnings,
             debug_jpg_bytes=debug_jpg,
+            photo_type=detected_photo_type,
         )
     except Exception:
         pass
@@ -386,10 +421,149 @@ async def measure_image(
     return {
         "id": measurement_id,
         "hand": detected_hand,
+        "photo_type": detected_photo_type,
         "scale_px_per_mm": round(card_result.px_per_mm, 3),
         "card_detected": True,
         "fingers": fingers_out,
         "overall_confidence": overall_confidence,
         "debug_image_b64": debug_b64,
         "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /pipeline/merge
+# ---------------------------------------------------------------------------
+
+
+@app.post("/pipeline/merge")
+async def merge_measurements(body: dict) -> dict:
+    """
+    Merge a thumb measurement and a four_finger measurement into a single
+    5-finger record.
+
+    Body: {"thumb_measurement_id": "msr_xxx", "four_finger_measurement_id": "msr_yyy"}
+    """
+    thumb_id = body.get("thumb_measurement_id")
+    four_finger_id = body.get("four_finger_measurement_id")
+
+    if not thumb_id or not four_finger_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_ids",
+                "message": "Both thumb_measurement_id and four_finger_measurement_id are required.",
+            },
+        )
+
+    if not _PERSIST:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "persistence_disabled", "message": "Persistence is disabled."},
+        )
+
+    try:
+        with _get_db() as conn:
+            thumb_row = conn.execute(
+                "SELECT * FROM measurements WHERE id = ?", (thumb_id,)
+            ).fetchone()
+            four_row = conn.execute(
+                "SELECT * FROM measurements WHERE id = ?", (four_finger_id,)
+            ).fetchone()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if thumb_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Measurement {thumb_id} not found."},
+        )
+    if four_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Measurement {four_finger_id} not found."},
+        )
+
+    thumb_data = dict(thumb_row)
+    four_data = dict(four_row)
+
+    # Validate photo_types
+    if thumb_data.get("photo_type") != "thumb":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "wrong_photo_type",
+                "message": f"Measurement {thumb_id} must have photo_type='thumb', got '{thumb_data.get('photo_type')}'.",
+            },
+        )
+    if four_data.get("photo_type") != "four_finger":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "wrong_photo_type",
+                "message": f"Measurement {four_finger_id} must have photo_type='four_finger', got '{four_data.get('photo_type')}'.",
+            },
+        )
+
+    # Validate same hand
+    if thumb_data.get("hand") != four_data.get("hand"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "hand_mismatch",
+                "message": (
+                    f"Measurements are for different hands: "
+                    f"'{thumb_data.get('hand')}' vs '{four_data.get('hand')}'."
+                ),
+            },
+        )
+
+    # Combine finger data
+    thumb_fingers = json.loads(thumb_data["fingers_json"])
+    four_fingers = json.loads(four_data["fingers_json"])
+
+    merged_fingers: dict = {}
+    if "thumb" in thumb_fingers:
+        merged_fingers["thumb"] = {**thumb_fingers["thumb"], "source_measurement": thumb_id}
+    for name in FOUR_FINGER_NAMES:
+        if name in four_fingers:
+            merged_fingers[name] = {**four_fingers[name], "source_measurement": four_finger_id}
+
+    # Overall confidence: average of both measurements' confidences
+    thumb_conf = thumb_data.get("confidence", 0.0) or 0.0
+    four_conf = four_data.get("confidence", 0.0) or 0.0
+    merged_confidence = round((thumb_conf + four_conf) / 2, 3)
+
+    # Use thumb's px_per_mm (both should be similar)
+    px_per_mm = thumb_data.get("px_per_mm") or four_data.get("px_per_mm") or 0.0
+
+    merged_id = f"msr_{uuid.uuid4().hex[:8]}"
+    merged_hand = thumb_data.get("hand")
+
+    try:
+        _save_measurement(
+            measurement_id=merged_id,
+            hand=merged_hand,
+            px_per_mm=px_per_mm,
+            fingers=merged_fingers,
+            confidence=merged_confidence,
+            warnings=[],
+            debug_jpg_bytes=None,
+            photo_type="merged",
+        )
+    except Exception:
+        pass
+
+    return {
+        "id": merged_id,
+        "hand": merged_hand,
+        "photo_type": "merged",
+        "scale_px_per_mm": round(px_per_mm, 3),
+        "fingers": merged_fingers,
+        "overall_confidence": merged_confidence,
+        "source_measurements": {
+            "thumb": thumb_id,
+            "four_finger": four_finger_id,
+        },
+        "warnings": [],
     }

@@ -106,6 +106,50 @@ def _process_result(results: Any, h: int, w: int) -> Optional[HandResult]:
     )
 
 
+def classify_photo_type(hand_result: "HandResult") -> str:
+    """Classify whether a photo shows the thumb only or 4 fingers (index–pinky).
+
+    Heuristic:
+    - The four-finger shot has index/middle/ring/pinky clustered close together,
+      while the thumb is far away.
+    - The thumb-only shot has the thumb at a meaningful position while the other
+      tips are either at (0,0) or squeezed into a tight cluster close to the wrist.
+
+    Returns "thumb" | "four_finger" | "unknown".
+    """
+    tips = hand_result.fingertip_positions
+    four_names = ["index", "middle", "ring", "pinky"]
+
+    thumb_pos = np.array(tips.get("thumb", (0, 0)), dtype=float)
+    four_positions = [np.array(tips.get(n, (0, 0)), dtype=float) for n in four_names]
+
+    # Count how many of the four fingertips are at (0, 0) (sentinel "not present")
+    four_at_origin = sum(1 for p in four_positions if p[0] == 0 and p[1] == 0)
+    thumb_at_origin = (thumb_pos[0] == 0 and thumb_pos[1] == 0)
+
+    # If all 5 fingertips are at real (non-origin) positions → cannot distinguish,
+    # treat as a full 5-finger shot (caller will use all fingers)
+    if not thumb_at_origin and four_at_origin == 0:
+        return "unknown"
+
+    # If 3+ of the four fingers are at origin but thumb is present → thumb shot
+    if four_at_origin >= 3 and not thumb_at_origin:
+        return "thumb"
+
+    # If thumb is at origin but four fingers present → four_finger shot
+    if thumb_at_origin and four_at_origin < 4:
+        return "four_finger"
+
+    # If only thumb seems to have a reasonable width and others don't
+    thumb_width = hand_result.finger_widths_px.get("thumb", 0.0)
+    four_widths = [hand_result.finger_widths_px.get(n, 0.0) for n in four_names]
+    avg_four_width = sum(four_widths) / len(four_widths) if four_widths else 0.0
+    if thumb_width > 10 and avg_four_width < 5:
+        return "thumb"
+
+    return "unknown"
+
+
 def _estimate_finger_widths(
     landmarks: List[Tuple[int, int]],
 ) -> Dict[str, float]:

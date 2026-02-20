@@ -66,26 +66,24 @@ Response 200 (failed validation):
 ```
 
 #### `POST /v1/measure`
-Full measurement pipeline. Takes 5-15 seconds.
+Full measurement pipeline for a single photo. Takes 5-15 seconds.
+
+**Two-photo flow:** Users must take 2 photos — one with 4 fingers on the card, one with the thumb. Each photo is submitted separately to `/measure`. The `photo_type` field indicates what was detected. Use `/measure/merge` to combine into a complete profile.
 
 ```
 Content-Type: multipart/form-data
 Body:
   image: (JPEG/PNG, max 10MB)
   hand: "left" | "right" (optional, auto-detected)
+  photo_type: "four_finger" | "thumb" (optional, auto-detected from landmarks)
 
 Response 200:
 {
   "id": "msr_a1b2c3d4",
   "hand": "right",
+  "photo_type": "four_finger",
   "scale_px_per_mm": 12.4,
   "fingers": {
-    "thumb": {
-      "width_mm": 16.2,
-      "length_mm": 12.1,
-      "curve_adj_width_mm": 17.8,
-      "confidence": 0.94
-    },
     "index": {
       "width_mm": 14.1,
       "length_mm": 11.3,
@@ -125,11 +123,44 @@ Response 400:
 }
 ```
 
+#### `POST /v1/measure/merge`
+Combine a thumb measurement and a four-finger measurement into a complete 5-finger profile.
+
+```json
+// Request
+{
+  "thumb_measurement_id": "msr_abc123",
+  "four_finger_measurement_id": "msr_def456"
+}
+
+// Response 200
+{
+  "id": "msr_merged_789",
+  "hand": "right",
+  "complete": true,
+  "fingers": {
+    "thumb":  { "width_mm": 16.2, "length_mm": 12.1, "curve_adj_width_mm": 17.8, "confidence": 0.94, "source_measurement": "msr_abc123" },
+    "index":  { "width_mm": 14.1, "length_mm": 11.3, "curve_adj_width_mm": 15.2, "confidence": 0.92, "source_measurement": "msr_def456" },
+    "middle": { "width_mm": 14.8, "length_mm": 12.0, "curve_adj_width_mm": 16.0, "confidence": 0.95, "source_measurement": "msr_def456" },
+    "ring":   { "width_mm": 13.2, "length_mm": 10.5, "curve_adj_width_mm": 14.2, "confidence": 0.91, "source_measurement": "msr_def456" },
+    "pinky":  { "width_mm": 11.0, "length_mm":  8.8, "curve_adj_width_mm": 11.8, "confidence": 0.88, "source_measurement": "msr_def456" }
+  },
+  "overall_confidence": 0.92,
+  "warnings": []
+}
+
+// Response 400
+{
+  "error": "incompatible_measurements",
+  "message": "Both measurements must be for the same hand"
+}
+```
+
 #### `GET /v1/measure/:id`
-Retrieve a previous measurement.
+Retrieve a previous measurement (single-photo or merged).
 
 ```
-Response 200: (same shape as POST /measure response)
+Response 200: (same shape as POST /measure response, with photo_type field)
 
 Response 404:
 { "error": "not_found", "message": "Measurement not found" }
@@ -142,7 +173,7 @@ List all measurements for a customer (history preserved, profile uses latest).
 // Response 200
 {
   "measurements": [ ... ],
-  "active_id": "msr_a1b2c3d4"  // the one powering current profile
+  "active_id": "msr_merged_789"  // the one powering current profile
 }
 ```
 

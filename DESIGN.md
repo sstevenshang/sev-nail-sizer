@@ -30,6 +30,15 @@
 
 ## CV/ML Pipeline
 
+### Two-Photo Requirement
+
+A standard credit card (85.6 × 53.98mm) is too small to fit all 5 fingers simultaneously. Users take **two photos**:
+
+1. **Four-finger photo:** Index, middle, ring, pinky placed flat on the card
+2. **Thumb photo:** Thumb placed flat on the card
+
+Both photos use the same card for scale calibration. The pipeline processes each independently, then merges results into one complete measurement.
+
 ### Step 1: Card Detection & Scale Calibration
 
 Classical CV — no ML needed:
@@ -45,6 +54,7 @@ Edge cases: card partially occluded (require corners visible via UI guidance), g
 1. **MediaPipe Hands** → 21 landmarks per hand, fingertip positions
 2. **Nail segmentation:** SAM 2 with point prompts at fingertip landmarks (zero-shot — no training data needed for MVP). Fine-tune U-Net later with ~500 annotated images.
 3. Per nail: extract width (widest horizontal at cuticle line) and length (cuticle to free edge along center axis)
+4. **Photo type detection:** Auto-detect whether photo contains thumb-only or four-fingers based on detected landmark count and positions
 
 ### Step 3: Curve Adjustment
 
@@ -60,16 +70,34 @@ v2: Train regression model on 3D nail scan data predicting C-curve % from 2D fea
 
 ### Pipeline Output
 
+Each `/measure` call returns partial results (thumb-only or four-finger). The `/measure/merge` endpoint combines two measurements into a complete profile:
+
 ```json
 {
   "hand": "right",
+  "photo_type": "four_finger",
   "scale_factor_px_per_mm": 12.4,
   "fingers": {
-    "thumb":  { "width_mm": 16.2, "length_mm": 12.1, "curve_adjusted_width_mm": 17.8, "recommended_size": "3" },
     "index":  { "width_mm": 14.1, "length_mm": 11.3, "curve_adjusted_width_mm": 15.2, "recommended_size": "5" },
     "middle": { "width_mm": 14.8, "length_mm": 12.0, "curve_adjusted_width_mm": 16.0, "recommended_size": "4" },
     "ring":   { "width_mm": 13.2, "length_mm": 10.5, "curve_adjusted_width_mm": 14.2, "recommended_size": "6" },
     "pinky":  { "width_mm": 11.0, "length_mm":  8.8, "curve_adjusted_width_mm": 11.8, "recommended_size": "8" }
+  },
+  "confidence": 0.92
+}
+```
+
+After merging both photos:
+```json
+{
+  "hand": "right",
+  "complete": true,
+  "fingers": {
+    "thumb":  { "width_mm": 16.2, "length_mm": 12.1, "curve_adjusted_width_mm": 17.8, "recommended_size": "3", "source_measurement": "msr_abc123" },
+    "index":  { "width_mm": 14.1, "length_mm": 11.3, "curve_adjusted_width_mm": 15.2, "recommended_size": "5", "source_measurement": "msr_def456" },
+    "middle": { "width_mm": 14.8, "length_mm": 12.0, "curve_adjusted_width_mm": 16.0, "recommended_size": "4", "source_measurement": "msr_def456" },
+    "ring":   { "width_mm": 13.2, "length_mm": 10.5, "curve_adjusted_width_mm": 14.2, "recommended_size": "6", "source_measurement": "msr_def456" },
+    "pinky":  { "width_mm": 11.0, "length_mm":  8.8, "curve_adjusted_width_mm": 11.8, "recommended_size": "8", "source_measurement": "msr_def456" }
   },
   "confidence": 0.92
 }
